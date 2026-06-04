@@ -91,6 +91,8 @@ FILLER = (0x3B, 0x42, 0x61)  # empty spacer segment that spans the ribbon to ful
 # ---- glyphs (Nerd Font) -- U-escape text only (literal PUA chars unreliable via tools) ----
 PL_SEP = "\U0000e0b0"        # triangle separator
 GIT_ICON = "\U0000e0a0"      # branch
+GIT_AHEAD_ICON = "\U0000f062"   # arrow-up -> commits ahead of upstream (unpushed)
+GIT_BEHIND_ICON = "\U0000f063"  # arrow-down -> commits behind upstream (unpulled)
 CLOCK_ICON = "\U0000f017"    # clock
 ICON_MAC = "\U000f0035"      # apple
 ICON_LINUX = "\U0000f17c"    # linux
@@ -183,7 +185,7 @@ def display_path(p: str) -> str:
     return p
 
 
-def git_info(cwd: str) -> tuple[str, str, int]:
+def git_info(cwd: str) -> tuple[str, str, int, int, int]:
     def g(args: list[str]) -> str:
         try:
             r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=1.0)
@@ -193,11 +195,17 @@ def git_info(cwd: str) -> tuple[str, str, int]:
 
     branch = g(["rev-parse", "--abbrev-ref", "HEAD"])
     if not branch:
-        return "", "", 0
+        return "", "", 0, 0, 0
     short = g(["rev-parse", "--short=9", "HEAD"])
     porcelain = g(["status", "--porcelain"])
     dirty = len([ln for ln in porcelain.splitlines() if ln.strip()]) if porcelain else 0
-    return branch, short, dirty
+    # commits behind / ahead of the upstream branch; one call, empty when no
+    # tracking branch is configured (detached HEAD, no remote) -> stays 0.
+    ahead = behind = 0
+    lr = g(["rev-list", "--left-right", "--count", "@{u}...HEAD"]).split()
+    if len(lr) == 2 and lr[0].isdigit() and lr[1].isdigit():
+        behind, ahead = int(lr[0]), int(lr[1])
+    return branch, short, dirty, ahead, behind
 
 
 def parse_transcript(path: str) -> tuple[float, int, int, int, int]:
@@ -387,7 +395,7 @@ def render(payload: dict) -> str:
     if not isinstance(ctx_pct, (int, float)):
         ctx_pct = (ctx_tokens / cw_size * 100) if cw_size else 0.0
 
-    branch, short, dirty = git_info(cwd)
+    branch, short, dirty, ahead, behind = git_info(cwd)
     plugins = list((ws.get("enabledPlugins") or {}).keys())
 
     # ---- line 2: metrics (tokens + cost left, bars right) ----
@@ -413,7 +421,13 @@ def render(payload: dict) -> str:
         (path_disp, SEG["peach"]),
     ]
     if branch:
-        gtext = f"{GIT_ICON} {branch} {short}" + (f"  •{dirty}" if dirty else "")
+        gtext = f"{GIT_ICON} {branch} {short}"
+        if ahead:
+            gtext += f"  {GIT_AHEAD_ICON} {ahead}"
+        if behind:
+            gtext += f"  {GIT_BEHIND_ICON} {behind}"
+        if dirty:
+            gtext += f"  •{dirty}"
         base_segs.append((gtext, SEG["yellow"]))
     base_segs.append((model_name, SEG["green"]))
     if effort:
