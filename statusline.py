@@ -3,8 +3,10 @@
 
 Layout:
   line 1  powerline ribbon (no caps):  OS | path | git | model(+ctx) | effort | clock
-  box     titled "designer", one metrics line:
-          in | out | cost(sess/all)  ||  ctx-bar | 5h-bar | 7d-bar | plugins | skills
+  line 2  metrics:  in | out | cost(sess/all)  ||  ctx-bar | 5h-bar | 7d-bar | plugins | skills
+  line 3  activity history:  green-intensity sparkline of per-day tokens over the
+          last N days (default 14) + N-day total + peak day. Toggle with
+          CLAUDE_STATUSLINE_HISTORY=0; window with CLAUDE_STATUSLINE_HISTORY_DAYS.
 
 Catppuccin Mocha palette. Line 1 uses powerline glyphs + Nerd Font icons (set
 Terminal.app font to MesloLGS Nerd Font). 24-bit truecolor, UTF-8 forced.
@@ -22,12 +24,18 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 CACHE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))) / "statusline-cache"
 COST_LOG = CACHE_DIR.parent / "statusline-cost.log"
 PILL_NAME = os.environ.get("CLAUDE_STATUSLINE_NAME", "designer")
+HIST_ENABLED = os.environ.get("CLAUDE_STATUSLINE_HISTORY", "1") != "0"
+try:
+    HIST_DAYS = max(1, min(60, int(os.environ.get("CLAUDE_STATUSLINE_HISTORY_DAYS", "14"))))
+except ValueError:
+    HIST_DAYS = 14
 
 # ---- ANSI (24-bit truecolor) ----
 R = "\033[0m"
@@ -88,6 +96,19 @@ SEG = {
 CRUST = (0x11, 0x11, 0x1B)
 FILLER = (0x3B, 0x42, 0x61)  # empty spacer segment that spans the ribbon to full width
 
+# ---- activity-history sparkline ----
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"  # 1/8..8/8 block heights
+# heat scale for the sparkline glyph color: an inverted ember ramp -- soft ash for
+# idle, then pale gold for the lightest days deepening to a rich orange for the
+# heaviest (more activity == darker orange; kept vivid, not brown, on the blue band)
+HEAT = [
+    (0x8E, 0x81, 0x7B),  # idle / zero -- soft warm ash
+    (0xFB, 0xDF, 0xA6),  # least active -- pale gold (lightest)
+    (0xF8, 0xC1, 0x82),  # light peach-orange
+    (0xF0, 0x9E, 0x52),  # orange
+    (0xE4, 0x77, 0x28),  # most active -- deep orange (darkest)
+]
+
 # ---- glyphs (Nerd Font) -- U-escape text only (literal PUA chars unreliable via tools) ----
 PL_SEP = "\U0000e0b0"        # triangle separator
 GIT_ICON = "\U0000e0a0"      # branch
@@ -102,6 +123,7 @@ ICON_5H = "\U0000f253"       # hourglass -> 5h
 ICON_WK = "\U0000f073"       # calendar -> 7d
 ICON_PLUG = "\U0000f1e6"     # plug
 ICON_SKILL = "\U000f07df"    # skills
+ICON_HIST = "\U0000f201"     # line-chart -> activity history
 ICON_IN = "\U0000f019"       # download -> tokens in
 ICON_OUT = "\U0000f093"      # upload -> tokens out
 ICON_COST = "\U0000efc8"     # currency-usd -> cost
@@ -117,6 +139,8 @@ def vis_len(s: str) -> int:
 
 def fmt_tok(n: int) -> str:
     n = int(n or 0)
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
     if n >= 1_000_000:
         return f"{n / 1e6:.1f}M"
     if n >= 1_000:
@@ -264,9 +288,16 @@ def rates_for(model_name: str) -> tuple[float, float]:
     return RATES["opus"]
 
 
-def _file_cost(path: Path) -> float:
+def _file_stats(path: Path) -> tuple[float, dict[str, int]]:
+    """Return (cost_usd, {local_day: tokens}) for one transcript.
+
+    Usage is counted once per message id (transcripts log each message multiple
+    times). Tokens are input + cache + output, bucketed by the local calendar day
+    of the message timestamp so the sparkline matches how a person reads "days".
+    """
     cost = 0.0
-    seen: set = set()  # transcripts log each message multiple times -- count usage once per id
+    days: dict[str, int] = {}
+    seen: set = set()
     try:
         with open(path, "r", errors="ignore") as fh:
             for ln in fh:
@@ -291,19 +322,27 @@ def _file_cost(path: Path) -> float:
                 cr = int(u.get("cache_read_input_tokens", 0) or 0)
                 ot = int(u.get("output_tokens", 0) or 0)
                 cost += (it * ri + cc * ri * 1.25 + cr * ri * 0.1 + ot * ro) / 1e6
+                ts = obj.get("timestamp") if isinstance(obj, dict) else None
+                if ts:
+                    try:
+                        day = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    days[day] = days.get(day, 0) + it + cc + cr + ot
     except OSError:
         pass
-    return cost
+    return cost, days
 
 
-def all_sessions_cost() -> float:
-    """Total estimated cost across every Claude Code transcript, incrementally cached.
+def all_sessions_stats() -> tuple[float, dict[str, int]]:
+    """Total estimated cost + per-local-day token totals across every transcript.
 
     Walks ~/.claude/projects/**/*.jsonl; re-reads only files whose mtime changed
-    since the last scan (others come from the cache), so steady-state cost is one
-    transcript re-read per answer.
+    since the last scan (others come from the cache), so steady state is one
+    transcript re-read per answer. The per-day token buckets feed the activity
+    sparkline on line 3.
     """
-    cache_path = CACHE_DIR / "costcache.json"
+    cache_path = CACHE_DIR / "statscache.json"
     cache: dict = {}
     if cache_path.exists():
         try:
@@ -312,6 +351,7 @@ def all_sessions_cost() -> float:
             cache = {}
     projects = CACHE_DIR.parent / "projects"
     total = 0.0
+    by_day: dict[str, int] = defaultdict(int)
     fresh: dict = {}
     if projects.is_dir():
         for f in projects.rglob("*.jsonl"):
@@ -321,15 +361,43 @@ def all_sessions_cost() -> float:
                 continue
             key = str(f)
             ent = cache.get(key)
-            c = ent[1] if (isinstance(ent, list) and len(ent) == 2 and abs(ent[0] - mt) < 1e-6) else _file_cost(f)
-            fresh[key] = [mt, c]
+            if isinstance(ent, list) and len(ent) == 3 and abs(ent[0] - mt) < 1e-6:
+                c, days = ent[1], ent[2]
+            else:
+                c, days = _file_stats(f)
+            fresh[key] = [mt, c, days]
             total += c
+            for d, t in days.items():
+                by_day[d] += int(t)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(fresh))
     except OSError:
         pass
-    return total
+    return total, dict(by_day)
+
+
+def day_series(by_day: dict[str, int], n_days: int) -> list[int]:
+    """The last n_days of per-day totals, oldest first, ending with today."""
+    today = datetime.now().date()
+    return [int(by_day.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), 0)) for i in range(n_days - 1, -1, -1)]
+
+
+def sparkline(vals: list[int]) -> str:
+    """Green-intensity block sparkline; idle days render as a dim grey baseline."""
+    mx = max(vals) if vals else 0
+    if mx <= 0:
+        return f"{SURF1}{'▁' * len(vals)}{R}"
+    out: list[str] = []
+    for v in vals:
+        if v <= 0:
+            out.append(f"{_fgc(HEAT[0])}▁")
+            continue
+        frac = v / mx
+        height = min(7, int(frac * 7.999))
+        level = min(4, 1 + int(frac * 3.999))
+        out.append(f"{_fgc(HEAT[level])}{SPARK_BLOCKS[height]}")
+    return "".join(out) + R
 
 
 def powerline(segments: list[tuple[str, tuple[int, int, int]]]) -> str:
@@ -388,7 +456,7 @@ def render(payload: dict) -> str:
     wk_eta = fmt_eta(int(seven.get("resets_at") or 0))
 
     cost, cur_ctx, n_skills, tok_in, tok_out = parse_transcript(str(payload.get("transcript_path") or ""))
-    total_cost = all_sessions_cost()
+    total_cost, by_day = all_sessions_stats()
 
     ctx_tokens = int(cw.get("total_input_tokens") or 0) or cur_ctx
     ctx_pct = cw.get("used_percentage")
@@ -415,6 +483,19 @@ def render(payload: dict) -> str:
         metrics += f"  {MAUVE}{ICON_SKILL} {n_skills}{R}"
     metrics += " "  # trailing margin; the ribbon spans to this same width so both right edges align
 
+    # ---- line 3: activity history (per-day tokens over HIST_DAYS) ----
+    activity = ""
+    if HIST_ENABLED:
+        hist = day_series(by_day, HIST_DAYS)
+        spark = sparkline(hist)
+        tot = fmt_tok(sum(hist))
+        peak = fmt_tok(max(hist) if hist else 0)
+        activity = (
+            f" {MAUVE}{ICON_HIST}{R} {SUBTEXT}activity{R} {spark}"
+            f"  {OVERLAY}{HIST_DAYS}d{R} {TEAL}{tot}{R}"
+            f"  {PEACH}▲{R} {YELLOW}{peak}{R} "
+        )
+
     # ---- line 1: powerline ribbon, spanned to the metrics width (clock right-aligned) ----
     base_segs: list[tuple[str, tuple[int, int, int]]] = [
         (os_icon(), SEG["red"]),
@@ -435,7 +516,7 @@ def render(payload: dict) -> str:
     time_text = f"{CLOCK_ICON} {datetime.now().strftime('%H:%M')}"
 
     all_segs = base_segs + [(time_text, SEG["lavender"])]
-    target_w = vis_len(metrics)
+    target_w = max(vis_len(metrics), vis_len(activity))
     need = target_w - vis_len(powerline(all_segs))
     if need > 0:
         # spread the slack across every segment proportional to its text length;
@@ -453,7 +534,12 @@ def render(payload: dict) -> str:
         segs = all_segs
     ribbon = powerline(segs)
 
-    return make_box([ribbon, metrics], PILL_NAME, [ROW1_BG, LINE2_BG])
+    lines = [ribbon, metrics]
+    bgs = [ROW1_BG, LINE2_BG]
+    if activity:
+        lines.append(activity)
+        bgs.append(LINE2_BG)  # share the metrics band so the two rows read as one panel
+    return make_box(lines, PILL_NAME, bgs)
 
 
 def main() -> None:
